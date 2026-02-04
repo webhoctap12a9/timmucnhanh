@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<title>Tìm nhanh trong văn bản</title>
+
+<!-- PWA -->
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#2563eb">
+
+<style>
+body {
+  font-family: system-ui, -apple-system;
+  background: #f4f6f8;
+  padding: 16px;
+}
+
+.container {
+  max-width: 900px;
+  margin: auto;
+  background: #ffffff;
+  padding: 16px;
+  border-radius: 10px;
+}
+
+.top {
+  display: flex;
+  gap: 6px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+
+input[type="file"] {
+  margin-bottom: 8px;
+}
+
+input[type="text"] {
+  flex: 1;
+  padding: 10px;
+}
+
+button {
+  padding: 10px 12px;
+  border-radius: 6px;
+  border: none;
+  cursor: pointer;
+}
+
+.btn-search { background: #2563eb; color: white; }
+.btn-clear, .btn-toggle, .btn-danger { background: #e5e7eb; }
+.btn-danger { background: #fee2e2; color: #991b1b; }
+
+/* results */
+.results-box {
+  max-height: 96px;
+  overflow-y: auto;
+  border: 1px solid #ddd;
+  margin-top: 8px;
+  padding: 6px;
+}
+
+/* CONTENT */
+#content {
+  margin-top: 10px;
+  border: 1px solid #ccc;
+  padding: 12px;
+  white-space: pre-wrap;
+  overflow-y: auto;
+}
+
+/* THU = ~8 dòng */
+.collapsed {
+  max-height: 200px;
+  overflow: hidden;
+}
+
+.hl { background: yellow; }
+
+/* HISTORY */
+.history-box {
+  display: none;
+  margin-top: 10px;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  padding: 6px;
+  background: #fafafa;
+  max-height: 120px;
+  overflow-y: auto;
+}
+
+.history-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 14px;
+  padding: 4px;
+}
+
+.history-item span {
+  cursor: pointer;
+  flex: 1;
+}
+</style>
+</head>
+
+<body>
+  <p>MR Hiếu</p>
+
+<div class="container">
+  <h2>🔍 Tìm nhanh trong văn bản</h2>
+
+  <input type="file" id="fileInput" accept=".docx,.md,.txt">
+
+  <div class="top">
+    <input id="keyword" placeholder="Nhập từ cần tìm">
+    <button class="btn-search" onclick="search()">Tìm</button>
+    <button class="btn-clear" onclick="clearSearch()">✕</button>
+    <button class="btn-toggle" onclick="toggleContent()">Thu / Mở</button>
+    <button class="btn-toggle" onclick="toggleHistory()">📜 Lịch sử</button>
+    <button class="btn-danger" onclick="clearAllData()">🗑 Xoá dữ liệu</button>
+  </div>
+
+  <div id="history" class="history-box"></div>
+  <div id="results" class="results-box"></div>
+  <div id="content" class="collapsed"></div>
+</div>
+
+<script src="https://unpkg.com/mammoth/mammoth.browser.min.js"></script>
+<script>
+/* ===== STATE ===== */
+let rawText = "";
+let isCollapsed = true;
+let currentFileId = null;
+let searchHistory = [];
+
+/* ===== ELEMENTS ===== */
+const contentEl = document.getElementById("content");
+const resultsEl = document.getElementById("results");
+const historyEl = document.getElementById("history");
+
+/* ===== INDEXED DB ===== */
+let db;
+const DB_NAME = "QuickSearchDB";
+
+const openDB = () => new Promise(resolve => {
+  const req = indexedDB.open(DB_NAME, 1);
+  req.onupgradeneeded = e => {
+    db = e.target.result;
+    db.createObjectStore("files", { keyPath: "id" });
+  };
+  req.onsuccess = e => {
+    db = e.target.result;
+    resolve();
+  };
+});
+
+/* ===== FILE HISTORY ===== */
+const saveFileHistory = () => {
+  if (!currentFileId) return;
+  const tx = db.transaction("files", "readwrite");
+  tx.objectStore("files").put({
+    id: currentFileId,
+    history: searchHistory
+  });
+};
+
+const loadFileHistory = () => new Promise(resolve => {
+  if (!currentFileId) return resolve([]);
+  const tx = db.transaction("files", "readonly");
+  const req = tx.objectStore("files").get(currentFileId);
+  req.onsuccess = () => resolve(req.result?.history || []);
+});
+
+/* ===== IMPORT FILE ===== */
+document.getElementById("fileInput").addEventListener("change", async e => {
+  const file = e.target.files[0];
+  if (!file) return;
+
+  currentFileId = file.name + "_" + file.size;
+
+  const reader = new FileReader();
+  const ext = file.name.split(".").pop().toLowerCase();
+
+  if (ext === "docx") {
+    reader.onload = async () => {
+      const res = await mammoth.extractRawText({ arrayBuffer: reader.result });
+      rawText = res.value;
+      contentEl.textContent = rawText;
+      await restoreHistory();
+    };
+    reader.readAsArrayBuffer(file);
+  } else {
+    reader.onload = async () => {
+      rawText = reader.result;
+      contentEl.textContent = rawText;
+      await restoreHistory();
+    };
+    reader.readAsText(file, "UTF-8");
+  }
+});
+
+/* ===== SEARCH ===== */
+function search() {
+  const kw = keyword.value.trim();
+  if (!kw || !rawText) return;
+
+  if (!searchHistory.includes(kw)) {
+    searchHistory.unshift(kw);
+    saveFileHistory();
+    renderHistory();
+  }
+
+  resultsEl.innerHTML = "";
+  let i = 0;
+  const regex = new RegExp(kw, "gi");
+
+  contentEl.innerHTML = rawText.replace(regex, m => {
+    const id = "m" + i++;
+    resultsEl.innerHTML += `<div onclick="jump('${id}')">📌 ${m}</div>`;
+    return `<span id="${id}" class="hl">${m}</span>`;
+  });
+
+  isCollapsed = false;
+  contentEl.classList.remove("collapsed");
+}
+
+/* ===== HISTORY ===== */
+function renderHistory() {
+  historyEl.innerHTML = "";
+  searchHistory.forEach((kw, i) => {
+    historyEl.innerHTML += `
+      <div class="history-item">
+        <span onclick="searchFromHistory('${kw}')">🔎 ${kw}</span>
+        <button onclick="removeHistory(${i})">✕</button>
+      </div>
+    `;
+  });
+}
+
+function searchFromHistory(kw) {
+  keyword.value = kw;
+  search();
+}
+
+function removeHistory(i) {
+  searchHistory.splice(i, 1);
+  saveFileHistory();
+  renderHistory();
+}
+
+function toggleHistory() {
+  historyEl.style.display =
+    historyEl.style.display === "block" ? "none" : "block";
+}
+
+/* ===== UTIL ===== */
+function jump(id) {
+  document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+function clearSearch() {
+  keyword.value = "";
+  resultsEl.innerHTML = "";
+  contentEl.textContent = rawText;
+}
+
+function toggleContent() {
+  isCollapsed = !isCollapsed;
+  contentEl.classList.toggle("collapsed", isCollapsed);
+}
+
+/* ===== RESTORE ===== */
+async function restoreHistory() {
+  await openDB();
+  searchHistory = await loadFileHistory();
+  renderHistory();
+}
+
+/* ===== CLEAR ALL DATA ===== */
+function clearAllData() {
+  if (!confirm("Xoá toàn bộ dữ liệu người dùng?")) return;
+  indexedDB.deleteDatabase(DB_NAME);
+  location.reload();
+}
+</script>
+
+<!-- REGISTER SERVICE WORKER -->
+<script>
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("service-worker.js");
+  });
+}
+</script>
+
+</body>
+</html>
